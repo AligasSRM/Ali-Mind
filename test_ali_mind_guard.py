@@ -1,6 +1,11 @@
 """Unit tests for the Ali-Mind consistency gate; no GitHub operations are performed."""
 import unittest
-from ali_mind_guard import (ControlSnapshot, Decision, OperationRequest, ResumeStatus, evaluate, prepare_resume_context)
+from unittest.mock import patch
+
+from ali_mind_guard import (
+    CheckpointComparisonStatus, ControlSnapshot, Decision, OperationRequest,
+    ResumeStatus, compare_checkpoint_changes, evaluate, prepare_resume_context,
+)
 
 
 def snapshot(**overrides):
@@ -93,6 +98,49 @@ class GateTests(unittest.TestCase):
         result = prepare_resume_context(control, "different-current-head")
         self.assertEqual(result.status, ResumeStatus.DENY)
         self.assertEqual(result.next_step, "recheck_current_head")
+
+    def test_checkpoint_comparison_reports_changed_paths_read_only(self):
+        checkpoint = "1" * 40
+        head = "2" * 40
+        control = snapshot(
+            historical_checkpoint_sha=checkpoint,
+            observed_head_sha=head,
+        )
+        responses = [
+            {"sha": head},
+            {
+                "base_commit": {"sha": checkpoint},
+                "head_commit": {"sha": head},
+                "ahead_by": 2,
+                "behind_by": 0,
+                "files": [{"filename": "ali_mind_guard.py"}, {"filename": "test_ali_mind_guard.py"}],
+            },
+        ]
+        with patch("ali_mind_guard._request_github_json", side_effect=responses):
+            result = compare_checkpoint_changes(control, head)
+        self.assertEqual(result.status, CheckpointComparisonStatus.DIFFERS)
+        self.assertEqual(result.ahead_by, 2)
+        self.assertEqual(result.behind_by, 0)
+        self.assertEqual(result.changed_paths, ("ali_mind_guard.py", "test_ali_mind_guard.py"))
+        self.assertIn("Read-only", result.reason)
+
+    def test_checkpoint_comparison_reports_exact_checkpoint_match(self):
+        head = "3" * 40
+        control = snapshot(historical_checkpoint_sha=head, observed_head_sha=head)
+        with patch("ali_mind_guard._request_github_json", return_value={"sha": head}):
+            result = compare_checkpoint_changes(control, head)
+        self.assertEqual(result.status, CheckpointComparisonStatus.MATCHES)
+        self.assertEqual(result.changed_paths, ())
+
+    def test_checkpoint_comparison_rejects_changed_live_head(self):
+        checkpoint = "4" * 40
+        observed = "5" * 40
+        live = "6" * 40
+        control = snapshot(historical_checkpoint_sha=checkpoint, observed_head_sha=observed)
+        with patch("ali_mind_guard._request_github_json", return_value={"sha": live}):
+            result = compare_checkpoint_changes(control, observed)
+        self.assertEqual(result.status, CheckpointComparisonStatus.DENY)
+        self.assertIn("Live main HEAD changed", result.reason)
 
     def test_resume_context_rejects_unverified_checkpoint(self):
         control = snapshot(verified=False)
