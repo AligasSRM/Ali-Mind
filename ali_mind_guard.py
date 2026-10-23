@@ -105,6 +105,8 @@ def prepare_resume_context(
         )
 
     required = (
+        snapshot.source,
+        snapshot.evidence_ref,
         snapshot.historical_checkpoint_sha,
         snapshot.observed_head_sha,
         snapshot.objective,
@@ -116,6 +118,20 @@ def prepare_resume_context(
             snapshot.historical_checkpoint_sha, snapshot.observed_head_sha,
             snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
             snapshot.allowed_paths, "stop", "Checkpoint context is incomplete.",
+        )
+    if not snapshot.verified:
+        return ResumeContext(
+            ResumeStatus.DENY, snapshot.repository, snapshot.branch,
+            snapshot.historical_checkpoint_sha, snapshot.observed_head_sha,
+            snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
+            snapshot.allowed_paths, "stop", "Checkpoint evidence is not marked verified.",
+        )
+    if not snapshot.phase_sequence or snapshot.active_phase not in snapshot.phase_sequence or not snapshot.allowed_paths:
+        return ResumeContext(
+            ResumeStatus.DENY, snapshot.repository, snapshot.branch,
+            snapshot.historical_checkpoint_sha, snapshot.observed_head_sha,
+            snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
+            snapshot.allowed_paths, "stop", "Checkpoint phase or allowed-path context is incomplete.",
         )
     if snapshot.repository != ALLOWED_REPOSITORY or snapshot.branch != ALLOWED_BRANCH:
         return ResumeContext(
