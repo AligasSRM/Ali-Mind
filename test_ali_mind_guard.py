@@ -1,6 +1,6 @@
 """Unit tests for the Ali-Mind consistency gate; no GitHub operations are performed."""
 import unittest
-from ali_mind_guard import ControlSnapshot, Decision, OperationRequest, evaluate
+from ali_mind_guard import (ControlSnapshot, Decision, OperationRequest, ResumeStatus, evaluate, prepare_resume_context)
 
 
 def snapshot(**overrides):
@@ -72,6 +72,33 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result.decision, Decision.ALLOW)
         self.assertIn("not a live authorization", result.reason)
 
+
+    def test_resume_context_returns_checkpoint_without_mutating_git(self):
+        control = snapshot()
+        result = prepare_resume_context(control, control.observed_head_sha)
+        self.assertEqual(result.status, ResumeStatus.HEAD_DIVERGED)
+        self.assertEqual(result.checkpoint_sha, control.historical_checkpoint_sha)
+        self.assertEqual(result.observed_head_sha, control.observed_head_sha)
+        self.assertEqual(result.next_step, "compare_current_head_with_checkpoint")
+        self.assertIn("without resetting", result.reason)
+
+    def test_resume_context_reports_when_head_matches_checkpoint(self):
+        control = snapshot(historical_checkpoint_sha="current-head-sha")
+        result = prepare_resume_context(control, control.observed_head_sha)
+        self.assertEqual(result.status, ResumeStatus.AT_CHECKPOINT)
+        self.assertEqual(result.next_step, "resume_from_checkpoint_context")
+
+    def test_resume_context_rejects_stale_observed_head(self):
+        control = snapshot()
+        result = prepare_resume_context(control, "different-current-head")
+        self.assertEqual(result.status, ResumeStatus.DENY)
+        self.assertEqual(result.next_step, "recheck_current_head")
+
+    def test_resume_context_rejects_other_repository(self):
+        control = snapshot(repository="AligasSRM/another-repo")
+        result = prepare_resume_context(control, control.observed_head_sha)
+        self.assertEqual(result.status, ResumeStatus.DENY)
+        self.assertEqual(result.next_step, "stop")
 
 if __name__ == "__main__":
     unittest.main()
