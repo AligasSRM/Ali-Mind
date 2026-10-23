@@ -6,9 +6,13 @@ verification alone must never turn caller-supplied policy fields into authorizat
 """
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import FrozenSet, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 ALLOWED_REPOSITORY = "AligasSRM/Ali-Mind"
 ALLOWED_BRANCH = "main"
@@ -164,6 +168,120 @@ def prepare_resume_context(
         snapshot.allowed_paths, "compare_current_head_with_checkpoint",
         "Current HEAD differs from the historical checkpoint. Preserve both references; compare the difference and resume context without resetting or rewriting Git.",
     )
+
+
+class CheckpointComparisonStatus(str, Enum):
+    MATCHES = "MATCHES"
+    DIFFERS = "DIFFERS"
+    DENY = "DENY"
+
+
+@dataclass(frozen=True)
+class CheckpointComparison:
+    """Read-only comparison of a historical checkpoint against live main."""
+
+    status: CheckpointComparisonStatus
+    checkpoint_sha: str
+    current_head_sha: str
+    ahead_by: int
+    behind_by: int
+    changed_paths: Tuple[str, ...]
+    reason: str
+
+
+def _request_github_json(url: str, timeout: float = 10.0) -> dict:
+    """Perform a read-only GitHub API GET and require a JSON object response."""
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "Ali-Mind-checkpoint-reader",
+        },
+        method="GET",
+    )
+    with urlopen(request, timeout=timeout) as response:
+        if getattr(response, "status", 200) != 200:
+            raise ValueError("GitHub returned a non-200 response.")
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub returned an unexpected JSON response.")
+    return payload
+
+
+def compare_checkpoint_changes(
+    snapshot: Optional[ControlSnapshot],
+    current_head_sha: str,
+    timeout: float = 10.0,
+) -> CheckpointComparison:
+    """Compare the pinned historical checkpoint with live Ali-Mind/main, read-only.
+
+    The live branch head must match the supplied current HEAD and the snapshot.
+    The function reports changed paths and ahead/behind counts; it never changes
+    files, checks out a commit, or rewrites Git history.
+    """
+    context = prepare_resume_context(snapshot, current_head_sha)
+    checkpoint_sha = context.checkpoint_sha
+    if context.status == ResumeStatus.DENY:
+        return CheckpointComparison(
+            CheckpointComparisonStatus.DENY, checkpoint_sha, current_head_sha,
+            0, 0, (), context.reason,
+        )
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", checkpoint_sha or "") or not re.fullmatch(
+        r"[0-9a-fA-F]{40}", current_head_sha or ""
+    ):
+        return CheckpointComparison(
+            CheckpointComparisonStatus.DENY, checkpoint_sha, current_head_sha,
+            0, 0, (), "Checkpoint and current HEAD must be full 40-character Git SHAs.",
+        )
+
+    api_root = "https://api.github.com/repos/AligasSRM/Ali-Mind"
+    try:
+        live_head = _request_github_json(f"{api_root}/commits/main", timeout)
+        live_sha = live_head.get("sha")
+        if live_sha != current_head_sha:
+            return CheckpointComparison(
+                CheckpointComparisonStatus.DENY, checkpoint_sha, current_head_sha,
+                0, 0, (), "Live main HEAD changed or does not match the supplied current HEAD; refresh the checkpoint context.",
+            )
+        if checkpoint_sha == current_head_sha:
+            return CheckpointComparison(
+                CheckpointComparisonStatus.MATCHES, checkpoint_sha, current_head_sha,
+                0, 0, (), "Historical checkpoint matches live main HEAD; no Git mutation was performed.",
+            )
+
+        comparison = _request_github_json(
+            f"{api_root}/compare/{checkpoint_sha}...{current_head_sha}", timeout
+        )
+        base = comparison.get("base_commit") or {}
+        head = comparison.get("head_commit") or {}
+        if base.get("sha") != checkpoint_sha or head.get("sha") != current_head_sha:
+            return CheckpointComparison(
+                CheckpointComparisonStatus.DENY, checkpoint_sha, current_head_sha,
+                0, 0, (), "GitHub comparison did not return the exact requested checkpoint and HEAD.",
+            )
+        files = comparison.get("files") or []
+        changed_paths = tuple(
+            item["filename"] for item in files
+            if isinstance(item, dict) and isinstance(item.get("filename"), str)
+        )
+        ahead_by = comparison.get("ahead_by")
+        behind_by = comparison.get("behind_by")
+        if not isinstance(ahead_by, int) or not isinstance(behind_by, int):
+            return CheckpointComparison(
+                CheckpointComparisonStatus.DENY, checkpoint_sha, current_head_sha,
+                0, 0, (), "GitHub comparison omitted valid ahead/behind counts.",
+            )
+        return CheckpointComparison(
+            CheckpointComparisonStatus.DIFFERS, checkpoint_sha, current_head_sha,
+            ahead_by, behind_by, changed_paths,
+            "Read-only comparison completed. Resume from the saved work context; do not reset or rewrite Git.",
+        )
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return CheckpointComparison(
+            CheckpointComparisonStatus.DENY, checkpoint_sha, current_head_sha,
+            0, 0, (), f"Read-only checkpoint comparison failed: {type(exc).__name__}: {exc}",
+        )
 
 
 def evaluate(snapshot: Optional[ControlSnapshot], request: OperationRequest) -> GateResult:
