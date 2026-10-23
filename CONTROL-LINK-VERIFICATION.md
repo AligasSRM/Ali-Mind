@@ -1,39 +1,41 @@
 # Ali-Control ↔ Ali-Mind Link Verification
 
-**Checked:** 2026-10-23  
+**Updated:** 2026-10-23  
 **Repository under change:** `AligasSRM/Ali-Mind`, branch `main`  
-**Reference repository:** `AligasSRM/Ali-Control`, read-only  
-**Current verification scope:** read-only live source check plus policy-gate binding tests.
+**Reference repository:** `AligasSRM/Ali-Control`, read-only
 
-## Implementation added
+## Decision that resolves the authority gap
 
-- `evaluate_with_live_control(snapshot, request)` runs the read-only Ali-Control reader before evaluating the request.
-- It fails closed unless the report has status `REQUIRE_APPROVAL`, contains exactly the three approved sources, and every source is verified against the same live `Ali-Control/main` commit.
-- It requires `snapshot.evidence_ref` to equal `ali-control:<live-head-sha>`; stale or unrelated evidence references are denied.
-- The ordinary policy checks still run after the live evidence binding. Forbidden actions remain denied, and write/document requests still require an explicit approval reference.
-- `test_live_control_binding.py` covers successful binding and fail-closed cases.
-- `.github/workflows/tests.yml` now runs the unit tests and `verify_live_control.py`. The live check performs GET requests only and prints evidence metadata, not source contents.
+Ali-Control's approved sources are Markdown and CODEOWNERS. They do not provide a machine-readable policy contract or a trusted operation-specific approval interface for the objective, active phase, allowed paths, checkpoint, and approval references expected by Ali-Mind.
 
-## Verified evidence
+**Resolution: fail closed; do not infer or invent policy authority.** Live source integrity alone must never grant `ALLOW` based on caller-supplied `ControlSnapshot` fields.
 
-The GitHub Actions run for commit `5c0eaa3851d8d5f0c69a91e4975e00e28eb32bf6` completed successfully:
+The live wrapper `evaluate_with_live_control()` now:
+1. Fetches the approved Ali-Control sources read-only and verifies the Git Blob SHAs at one stable `main` HEAD.
+2. Requires the exact approved source set and binds `snapshot.evidence_ref` to `ali-control:<verified-head-sha>`.
+3. Denies missing, stale, inconsistent, or unverified evidence.
+4. Keeps explicitly forbidden actions denied.
+5. Returns `REQUIRE_APPROVAL` rather than `ALLOW` when the consistency checks pass but the trusted machine-readable policy/operation-approval contract is absent. Caller-supplied approval references do not bypass this rule.
 
-- Unit tests: **25 passed**.
-- Live source verification: **PASS**.
-- Ali-Control `main` observed by the live check: `11a61ddb5b52a5696d530cf262ace7fd0b426c67`.
-- All three approved sources were fetched at that same commit and their Git Blob SHAs verified.
-- Reader result: `REQUIRE_APPROVAL`. This is expected: source integrity does not grant permission to perform an operation.
-- No write, merge, delete, permission change, or protection change was performed in Ali-Control.
+The lower-level `evaluate()` function performs consistency checks on supplied fields only. Its `ALLOW` result is **not live authorization** and must not be used as a substitute for `evaluate_with_live_control()` in an operational path.
 
-Run evidence: https://github.com/AligasSRM/Ali-Mind/actions/runs/39964166297
+## Automated verification
 
-## Important remaining boundary
+GitHub Actions workflow `.github/workflows/tests.yml` runs:
+- `python -m unittest discover -v`
+- `python verify_live_control.py` against the real GitHub API, using read-only GET requests.
 
-Ali-Control currently exposes these references as Markdown and CODEOWNERS, not as a dedicated machine-readable policy/approval contract. Therefore:
+The earlier live verification run `39964166297` passed 25 tests and verified these three sources at the same Ali-Control HEAD `11a61ddb5b52a5696d530cf262ace7fd0b426c67`:
+- `README.md`
+- `docs/CONTROL-STATUS-AND-ROADMAP.md`
+- `.github/CODEOWNERS`
 
-- The live wrapper proves the approved sources are reachable, intact, and pinned to a stable HEAD, and binds a policy evaluation to that exact HEAD.
-- Project-specific fields in `ControlSnapshot` (objective, phase, allowed paths, checkpoint, and operation approval references) are still supplied by the caller; they are **not automatically parsed or proven to originate from the Markdown sources**.
-- The live check does not constitute approval for a particular write operation.
-- The low-level `evaluate()` function remains a policy-only evaluator; callers requiring a live link must use `evaluate_with_live_control()`.
+The new tests additionally require fail-closed behavior when source authority is missing, including an attempt to use a caller-invented approval reference. The current workflow must pass again after this policy change before the updated revision is considered verified.
 
-Accordingly, the **live-source and gate-binding conditions are verified**, but a claim that all policy fields are automatically derived from Ali-Control evidence would be unsupported. Full end-to-end closure requires an approved, machine-readable contract or a separately reviewed deterministic mapping for those fields, without changing Ali-Control in this task. Until then, do not describe the entire control relationship as fully closed.
+## Scope and safety
+
+- Only `AligasSRM/Ali-Mind` on its existing `main` branch was changed.
+- `AligasSRM/Ali-Control` was read only; no writes, merges, deletions, permission changes, or protection changes were made there.
+- No phase status was changed and no new project phase was opened.
+- Source integrity is not approval to perform a particular operation.
+- Full automatic policy-based authorization remains intentionally unavailable until an approved structured policy/approval contract exists. That is now a defined fail-closed outcome, not an implicit authorization gap.
