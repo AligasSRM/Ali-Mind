@@ -23,6 +23,19 @@ The live wrapper `evaluate_with_live_control()`:
 
 The lower-level `evaluate()` function performs consistency checks on supplied fields only. Its `ALLOW` result is **not live authorization** and must not be used as a substitute for `evaluate_with_live_control()` in an operational path.
 
+## Scoped work-direction and checkpoint-resume behavior
+
+The local guard's `evaluate()` checks the supplied work request against the supplied context for repository, branch, objective, phase, allowed paths, and observed HEAD. It is a consistency gate, not proof that caller-supplied policy fields are authoritative. The live wrapper therefore continues to fail closed when Ali-Control lacks a trusted machine-readable operation-policy contract.
+
+The read-only `prepare_resume_context(snapshot, current_head_sha)` function now:
+- rejects missing, incomplete, out-of-scope, or stale checkpoint context;
+- preserves the historical checkpoint SHA separately from the observed current HEAD;
+- returns `AT_CHECKPOINT` when both references match, or `HEAD_DIVERGED` when they differ;
+- returns the saved objective, phase sequence, and allowed paths needed to resume the work context;
+- instructs the caller to compare the current HEAD with the checkpoint when they differ; it never checks out, resets, rewrites, or otherwise mutates Git.
+
+The tests in `test_ali_mind_guard.py` cover matching and divergent checkpoint references, stale HEAD context, and repository-scope rejection. These tests validate the local context decision only; they do not establish a trusted structured Ali-Control policy source or live authorization.
+
 ## Automated verification and evidence
 
 GitHub Actions workflow `.github/workflows/tests.yml` runs:
