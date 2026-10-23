@@ -1,8 +1,8 @@
 """Fail-closed policy gate for Ali-Mind operations.
 
-This module evaluates requests only. It never performs the requested operation.
-The live wrapper binds a policy decision to verified, read-only evidence fetched
-from the approved Ali-Control repository.
+The live wrapper verifies read-only Ali-Control source integrity. Because Ali-Control
+currently has no machine-readable policy/operation-approval contract, live source
+verification alone must never turn caller-supplied policy fields into authorization.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class Decision(str, Enum):
 
 @dataclass(frozen=True)
 class ControlSnapshot:
-    """Project-specific control contract; live evidence binding is checked separately."""
+    """Caller-supplied policy fields; not an authority source by themselves."""
 
     source: str
     evidence_ref: str
@@ -65,7 +65,7 @@ _FORBIDDEN_ACTIONS = frozenset({
 
 
 def evaluate(snapshot: Optional[ControlSnapshot], request: OperationRequest) -> GateResult:
-    """Evaluate caller-supplied policy fields only; does not prove live control linkage."""
+    """Evaluate supplied fields as consistency checks only; not a live authorization."""
     checks = []
     if snapshot is None:
         return GateResult(Decision.DENY, "Missing control snapshot; fail closed.", ("control_snapshot_present",))
@@ -99,28 +99,28 @@ def evaluate(snapshot: Optional[ControlSnapshot], request: OperationRequest) -> 
     checks.append("action_policy")
 
     if not request.objective or request.objective != snapshot.objective:
-        return GateResult(Decision.DENY, "Request objective is missing or differs from the controlled objective.", tuple(checks + ["objective_match"]))
+        return GateResult(Decision.DENY, "Request objective is missing or differs from the supplied snapshot.", tuple(checks + ["objective_match"]))
     checks.append("objective_match")
 
     if request.phase != snapshot.active_phase:
         if request.phase in snapshot.phase_sequence and snapshot.active_phase in snapshot.phase_sequence:
-            return GateResult(Decision.REQUIRE_APPROVAL, "Phase differs from the active controlled phase; explicit approval is required.", tuple(checks + ["phase_match"]))
-        return GateResult(Decision.DENY, "Requested phase is absent from the controlled phase sequence.", tuple(checks + ["phase_sequence"]))
+            return GateResult(Decision.REQUIRE_APPROVAL, "Phase differs from the supplied active phase; explicit approval is required.", tuple(checks + ["phase_match"]))
+        return GateResult(Decision.DENY, "Requested phase is absent from the supplied phase sequence.", tuple(checks + ["phase_sequence"]))
     if not snapshot.phase_sequence or snapshot.active_phase not in snapshot.phase_sequence:
-        return GateResult(Decision.DENY, "Control phase sequence is missing or inconsistent.", tuple(checks + ["phase_sequence"]))
+        return GateResult(Decision.DENY, "Supplied phase sequence is missing or inconsistent.", tuple(checks + ["phase_sequence"]))
     checks.extend(("phase_sequence", "phase_match"))
 
     if not request.paths:
         return GateResult(Decision.DENY, "No target path supplied; fail closed.", tuple(checks + ["path_scope"]))
     outside = sorted(set(request.paths) - set(snapshot.allowed_paths))
     if outside:
-        return GateResult(Decision.DENY, "Target path outside the explicitly allowed set: " + ", ".join(outside), tuple(checks + ["path_scope"]))
+        return GateResult(Decision.DENY, "Target path outside the supplied allowed set: " + ", ".join(outside), tuple(checks + ["path_scope"]))
     if any(path.startswith("/") or ".." in path.split("/") or "\\" in path for path in request.paths):
         return GateResult(Decision.DENY, "Unsafe or non-repository-relative path supplied.", tuple(checks + ["path_safety"]))
     checks.extend(("path_scope", "path_safety"))
 
     if not request.expected_head_sha or request.expected_head_sha != snapshot.observed_head_sha:
-        return GateResult(Decision.DENY, "Expected branch head is missing or does not match the observed head.", tuple(checks + ["head_match"]))
+        return GateResult(Decision.DENY, "Expected branch head does not match the supplied observed head.", tuple(checks + ["head_match"]))
     checks.append("head_match")
 
     if request.action in {"write", "document"}:
@@ -128,7 +128,7 @@ def evaluate(snapshot: Optional[ControlSnapshot], request: OperationRequest) -> 
             return GateResult(Decision.REQUIRE_APPROVAL, "No matching explicit approval decision reference was supplied.", tuple(checks + ["approval_reference"]))
         checks.append("approval_reference")
 
-    return GateResult(Decision.ALLOW, "Policy checks passed. This is a decision only; no operation was executed.", tuple(checks + ["decision_only_no_side_effects"]))
+    return GateResult(Decision.ALLOW, "Consistency checks passed only; this result is not a live authorization.", tuple(checks + ["consistency_only_no_side_effects"]))
 
 
 def evaluate_with_live_control(
@@ -136,12 +136,11 @@ def evaluate_with_live_control(
     request: OperationRequest,
     timeout: float = 10.0,
 ) -> GateResult:
-    """Require fresh, verified Ali-Control evidence before evaluating any request.
+    """Verify live sources, then fail closed on absent machine-readable policy authority.
 
-    The live report proves source identity/integrity and a stable Ali-Control main
-    HEAD. It does not itself define project-specific policy fields or grant approval.
-    Those fields remain explicit in snapshot and are accepted only when its evidence
-    reference is bound to the exact live HEAD observed in this call.
+    Ali-Control's approved sources are Markdown and CODEOWNERS, not a structured
+    policy/operation-approval contract. Therefore caller-supplied snapshot fields
+    cannot be promoted to ALLOW solely because the source files are intact.
     """
     from ali_control_reader import SOURCE_PATHS, read_control_evidence
 
@@ -164,8 +163,12 @@ def evaluate_with_live_control(
         return GateResult(Decision.DENY, "Snapshot policy fields are not marked verified.", ("snapshot_policy_verified",))
 
     result = evaluate(snapshot, request)
+    checks = ("live_control_evidence_verified", "live_control_source_set", "live_control_evidence_consistent", "live_control_evidence_binding") + result.checks
+    if result.decision != Decision.ALLOW:
+        return GateResult(result.decision, result.reason, checks)
+
     return GateResult(
-        result.decision,
-        result.reason,
-        ("live_control_evidence_verified", "live_control_source_set", "live_control_evidence_consistent", "live_control_evidence_binding") + result.checks,
+        Decision.REQUIRE_APPROVAL,
+        "Live source integrity is verified, but Ali-Control has no machine-readable policy/operation-approval contract. Caller-supplied phase, paths, checkpoint, and decision fields cannot authorize this request. No operation was executed.",
+        checks + ("machine_readable_policy_authority_missing", "fail_closed_no_automatic_allow"),
     )
