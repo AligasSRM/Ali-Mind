@@ -94,6 +94,12 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result.status, ResumeStatus.DENY)
         self.assertEqual(result.next_step, "recheck_current_head")
 
+    def test_resume_context_rejects_unverified_checkpoint(self):
+        control = snapshot(verified=False)
+        result = prepare_resume_context(control, control.observed_head_sha)
+        self.assertEqual(result.status, ResumeStatus.DENY)
+        self.assertEqual(result.next_step, "stop")
+
     def test_resume_context_rejects_other_repository(self):
         control = snapshot(repository="AligasSRM/another-repo")
         result = prepare_resume_context(control, control.observed_head_sha)
