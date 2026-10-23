@@ -18,7 +18,7 @@ SOURCES = {
 
 
 def blob_sha(raw):
-    return hashlib.sha1(f"blob {len(raw)}\\0".encode("ascii") + raw).hexdigest()
+    return hashlib.sha1(f"blob {len(raw)}\0".encode("ascii") + raw).hexdigest()
 
 
 class FakeResponse:
