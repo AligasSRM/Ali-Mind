@@ -27,14 +27,15 @@ The lower-level `evaluate()` function performs consistency checks on supplied fi
 
 The local guard's `evaluate()` checks the supplied work request against the supplied context for repository, branch, objective, phase, allowed paths, and observed HEAD. It is a consistency gate, not proof that caller-supplied policy fields are authoritative. The live wrapper therefore continues to fail closed when Ali-Control lacks a trusted machine-readable operation-policy contract.
 
-The read-only `prepare_resume_context(snapshot, current_head_sha)` function now:
-- rejects missing, incomplete, out-of-scope, or stale checkpoint context;
+The read-only `prepare_resume_context(snapshot, current_head_sha)` function:
+- rejects missing, incomplete, unverified, out-of-scope, or stale checkpoint context;
 - preserves the historical checkpoint SHA separately from the observed current HEAD;
 - returns `AT_CHECKPOINT` when both references match, or `HEAD_DIVERGED` when they differ;
-- returns the saved objective, phase sequence, and allowed paths needed to resume the work context;
-- instructs the caller to compare the current HEAD with the checkpoint when they differ; it never checks out, resets, rewrites, or otherwise mutates Git.
+- returns the saved objective, phase sequence, and allowed paths needed to resume the work context.
 
-The tests in `test_ali_mind_guard.py` cover matching and divergent checkpoint references, stale HEAD context, and repository-scope rejection. These tests validate the local context decision only; they do not establish a trusted structured Ali-Control policy source or live authorization.
+The read-only `compare_checkpoint_changes(snapshot, current_head_sha)` function verifies that live `Ali-Mind/main` still matches the supplied HEAD, then compares the historical checkpoint against that exact HEAD through GitHub's read-only compare endpoint. It returns ahead/behind counts and changed file paths, or fails closed if the live HEAD or comparison evidence is stale/inconsistent. Neither function checks out, resets, rewrites, or otherwise mutates Git.
+
+The tests in `test_ali_mind_guard.py` cover checkpoint match/divergence, changed-path reporting, stale live HEAD, incomplete/unverified context, and repository-scope rejection. These tests validate checkpoint comparison and local work-context consistency; they do not establish a trusted structured Ali-Control policy source or live authorization.
 
 ## Automated verification and evidence
 
