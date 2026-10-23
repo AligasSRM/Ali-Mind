@@ -1,4 +1,4 @@
-"""Tests for the live Ali-Control to Ali-Mind policy-gate binding."""
+"""Tests for live source binding and fail-closed policy authority."""
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,7 +22,7 @@ def live_report(status="REQUIRE_APPROVAL", head=HEAD, paths=SOURCE_PATHS, verifi
 
 def make_snapshot(**overrides):
     values = dict(
-        source="reviewed-control-evidence",
+        source="caller-supplied",
         evidence_ref=CONTROL_EVIDENCE_PREFIX + HEAD,
         verified=True,
         repository="AligasSRM/Ali-Mind",
@@ -31,7 +31,7 @@ def make_snapshot(**overrides):
         active_phase="A7",
         phase_sequence=("A1", "A2", "A3", "A4", "A5", "A6", "A7"),
         allowed_paths=frozenset({"ali_mind_guard.py"}),
-        approved_decisions=frozenset(),
+        approved_decisions=frozenset({"invented-approval"}),
         observed_head_sha="current-head",
         historical_checkpoint_sha="historical-checkpoint",
     )
@@ -50,12 +50,13 @@ def make_request(**overrides):
 
 
 class LiveBindingTests(unittest.TestCase):
-    def test_live_verified_evidence_is_bound_before_gate_evaluation(self):
+    def test_verified_sources_do_not_turn_caller_snapshot_into_authorization(self):
         with patch("ali_control_reader.read_control_evidence", return_value=live_report()):
             result = evaluate_with_live_control(make_snapshot(), make_request())
-        self.assertEqual(result.decision, Decision.ALLOW)
+        self.assertEqual(result.decision, Decision.REQUIRE_APPROVAL)
         self.assertIn("live_control_evidence_verified", result.checks)
         self.assertIn("live_control_evidence_binding", result.checks)
+        self.assertIn("machine_readable_policy_authority_missing", result.checks)
 
     def test_snapshot_with_unbound_or_stale_head_is_denied(self):
         with patch("ali_control_reader.read_control_evidence", return_value=live_report()):
@@ -88,10 +89,19 @@ class LiveBindingTests(unittest.TestCase):
             result = evaluate_with_live_control(make_snapshot(), make_request())
         self.assertEqual(result.decision, Decision.DENY)
 
-    def test_live_binding_does_not_override_policy_denial(self):
+    def test_forbidden_action_remains_denied(self):
         with patch("ali_control_reader.read_control_evidence", return_value=live_report()):
             result = evaluate_with_live_control(make_snapshot(), make_request(action="delete"))
         self.assertEqual(result.decision, Decision.DENY)
+
+    def test_caller_invented_approval_never_authorizes_write(self):
+        with patch("ali_control_reader.read_control_evidence", return_value=live_report()):
+            result = evaluate_with_live_control(
+                make_snapshot(),
+                make_request(action="write", decision_ref="invented-approval"),
+            )
+        self.assertEqual(result.decision, Decision.REQUIRE_APPROVAL)
+        self.assertIn("machine-readable policy/operation-approval contract", result.reason)
 
 
 if __name__ == "__main__":
