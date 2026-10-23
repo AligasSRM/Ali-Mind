@@ -1,8 +1,8 @@
 """Fail-closed policy gate for Ali-Mind operations.
 
-This module evaluates requests only. It does not call GitHub, mutate files, merge,
-change permissions, delete resources, or perform rollback. A supplied control
-snapshot is a caller-provided contract, not proof of a live Ali-Control link.
+This module evaluates requests only. It never performs the requested operation.
+The live wrapper binds a policy decision to verified, read-only evidence fetched
+from the approved Ali-Control repository.
 """
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import FrozenSet, Optional, Tuple
 
-
 ALLOWED_REPOSITORY = "AligasSRM/Ali-Mind"
 ALLOWED_BRANCH = "main"
+CONTROL_EVIDENCE_PREFIX = "ali-control:"
 
 
 class Decision(str, Enum):
@@ -23,7 +23,7 @@ class Decision(str, Enum):
 
 @dataclass(frozen=True)
 class ControlSnapshot:
-    """Explicit control evidence supplied to the gate; not fetched automatically."""
+    """Project-specific control contract; live evidence binding is checked separately."""
 
     source: str
     evidence_ref: str
@@ -59,39 +59,27 @@ class GateResult:
 
 
 _FORBIDDEN_ACTIONS = frozenset({
-    "delete",
-    "rollback",
-    "change_protection",
-    "change_permissions",
-    "create_branch",
-    "merge",
+    "delete", "rollback", "change_protection", "change_permissions",
+    "create_branch", "merge",
 })
 
 
 def evaluate(snapshot: Optional[ControlSnapshot], request: OperationRequest) -> GateResult:
-    """Return a policy decision; never executes the requested operation."""
+    """Evaluate caller-supplied policy fields only; does not prove live control linkage."""
     checks = []
-
     if snapshot is None:
         return GateResult(Decision.DENY, "Missing control snapshot; fail closed.", ("control_snapshot_present",))
 
     required = {
-        "source": snapshot.source,
-        "evidence_ref": snapshot.evidence_ref,
-        "repository": snapshot.repository,
-        "branch": snapshot.branch,
-        "objective": snapshot.objective,
-        "active_phase": snapshot.active_phase,
+        "source": snapshot.source, "evidence_ref": snapshot.evidence_ref,
+        "repository": snapshot.repository, "branch": snapshot.branch,
+        "objective": snapshot.objective, "active_phase": snapshot.active_phase,
         "observed_head_sha": snapshot.observed_head_sha,
         "historical_checkpoint_sha": snapshot.historical_checkpoint_sha,
     }
     missing = sorted(name for name, value in required.items() if not value)
     if missing:
-        return GateResult(
-            Decision.DENY,
-            "Control snapshot is incomplete: " + ", ".join(missing) + ".",
-            ("control_snapshot_complete",),
-        )
+        return GateResult(Decision.DENY, "Control snapshot is incomplete: " + ", ".join(missing) + ".", ("control_snapshot_complete",))
     checks.append("control_snapshot_complete")
 
     if not snapshot.verified:
@@ -140,8 +128,44 @@ def evaluate(snapshot: Optional[ControlSnapshot], request: OperationRequest) -> 
             return GateResult(Decision.REQUIRE_APPROVAL, "No matching explicit approval decision reference was supplied.", tuple(checks + ["approval_reference"]))
         checks.append("approval_reference")
 
+    return GateResult(Decision.ALLOW, "Policy checks passed. This is a decision only; no operation was executed.", tuple(checks + ["decision_only_no_side_effects"]))
+
+
+def evaluate_with_live_control(
+    snapshot: Optional[ControlSnapshot],
+    request: OperationRequest,
+    timeout: float = 10.0,
+) -> GateResult:
+    """Require fresh, verified Ali-Control evidence before evaluating any request.
+
+    The live report proves source identity/integrity and a stable Ali-Control main
+    HEAD. It does not itself define project-specific policy fields or grant approval.
+    Those fields remain explicit in snapshot and are accepted only when its evidence
+    reference is bound to the exact live HEAD observed in this call.
+    """
+    from ali_control_reader import SOURCE_PATHS, read_control_evidence
+
+    if snapshot is None:
+        return GateResult(Decision.DENY, "Missing control snapshot; live evidence cannot be bound.", ("control_snapshot_present",))
+    report = read_control_evidence(timeout=timeout)
+    if report.status != "REQUIRE_APPROVAL":
+        return GateResult(Decision.DENY, "Live Ali-Control evidence could not be verified: " + report.detail, ("live_control_evidence_verified",))
+    if len(report.sources) != len(SOURCE_PATHS) or tuple(item.path for item in report.sources) != SOURCE_PATHS:
+        return GateResult(Decision.DENY, "Live report does not contain exactly the approved source set.", ("live_control_source_set",))
+    if not report.head_sha or any(
+        not item.verified or item.commit_sha != report.head_sha or item.repository != "AligasSRM/Ali-Control" or item.branch != "main"
+        for item in report.sources
+    ):
+        return GateResult(Decision.DENY, "Live evidence is incomplete or not pinned to one verified Ali-Control main HEAD.", ("live_control_evidence_consistent",))
+    expected_ref = CONTROL_EVIDENCE_PREFIX + report.head_sha
+    if snapshot.evidence_ref != expected_ref:
+        return GateResult(Decision.DENY, "Snapshot evidence_ref is not bound to the live Ali-Control HEAD.", ("live_control_evidence_binding",))
+    if not snapshot.verified:
+        return GateResult(Decision.DENY, "Snapshot policy fields are not marked verified.", ("snapshot_policy_verified",))
+
+    result = evaluate(snapshot, request)
     return GateResult(
-        Decision.ALLOW,
-        "Policy checks passed. This is a decision only; no operation was executed.",
-        tuple(checks + ["decision_only_no_side_effects"]),
+        result.decision,
+        result.reason,
+        ("live_control_evidence_verified", "live_control_source_set", "live_control_evidence_consistent", "live_control_evidence_binding") + result.checks,
     )
