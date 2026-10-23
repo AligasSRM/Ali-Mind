@@ -85,7 +85,7 @@ def _request_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
 
 
 def _blob_sha(content: bytes) -> str:
-    header = f"blob {len(content)}\\0".encode("ascii")
+    header = f"blob {len(content)}\0".encode("ascii")
     return hashlib.sha1(header + content).hexdigest()
 
 
