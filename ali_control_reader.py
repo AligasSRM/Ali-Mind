@@ -1,12 +1,6 @@
-"""Read-only evidence collector for the approved Ali-Control sources.
-
-This module fetches only public GitHub metadata/content for the fixed allowlist.
-It never writes to GitHub or treats source integrity as operation approval.
-"""
+"""Resolve the approved Ali-Control repository and branch without reading files."""
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -17,52 +11,27 @@ from urllib.request import Request, urlopen
 CONTROL_REPOSITORY = "AligasSRM/Ali-Control"
 CONTROL_BRANCH = "main"
 API_ROOT = "https://api.github.com"
-REQUIRED_PATHS = (
-    "README.md",
-    "docs/CONTROL-STATUS-AND-ROADMAP.md",
-    ".github/CODEOWNERS",
-)
+REPOSITORY_URL = f"https://github.com/{CONTROL_REPOSITORY}"
+BRANCH_URL = f"{REPOSITORY_URL}/tree/{CONTROL_BRANCH}"
 
 
 @dataclass(frozen=True)
-class SourceEvidence:
+class PathReport:
     repository: str
     branch: str
-    path: str
-    commit_sha: str
-    blob_sha: str
+    repository_url: str
+    branch_url: str
+    head_sha: str
     checked_at_utc: str
-    verified: bool
     status: str
     detail: str = ""
 
-
-@dataclass(frozen=True)
-class ReaderReport:
-    repository: str
-    branch: str
-    head_sha: str
-    checked_at_utc: str
-    decision: str
-    authorization_established: bool
-    sources: tuple[SourceEvidence, ...]
-    errors: tuple[str, ...]
-
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "repository": self.repository,
-            "branch": self.branch,
-            "head_sha": self.head_sha,
-            "checked_at_utc": self.checked_at_utc,
-            "decision": self.decision,
-            "authorization_established": self.authorization_established,
-            "sources": [asdict(source) for source in self.sources],
-            "errors": list(self.errors),
-        }
+        return asdict(self)
 
 
-class ReaderError(RuntimeError):
-    """Raised internally when a required source cannot be verified."""
+class LocatorError(RuntimeError):
+    """Raised when the approved repository or branch cannot be verified."""
 
 
 def _now() -> str:
@@ -75,121 +44,89 @@ def _request_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
         headers={
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "Ali-Mind-read-only-control-reader",
+            "User-Agent": "Ali-Mind-control-path-reader",
         },
         method="GET",
     )
     with urlopen(request, timeout=timeout) as response:
         status = getattr(response, "status", 200)
         if status != 200:
-            raise ReaderError(f"GitHub returned HTTP {status} for {url}")
+            raise LocatorError(f"GitHub returned HTTP {status}.")
         payload = json.loads(response.read().decode("utf-8"))
+
     if not isinstance(payload, dict):
-        raise ReaderError(f"Unexpected JSON shape for {url}")
+        raise LocatorError("GitHub returned an unexpected JSON response.")
     return payload
 
 
-def git_blob_sha(content: bytes) -> str:
-    """Compute Git's canonical SHA-1 for a blob, including its header."""
-    header = f"blob {len(content)}\0".encode("ascii")
-    return hashlib.sha1(header + content).hexdigest()
-
-
-def collect_evidence(timeout: float = 10.0) -> ReaderReport:
-    """Collect source evidence from one pinned main-branch commit; never authorize."""
+def resolve_control_path(timeout: float = 10.0) -> PathReport:
+    """Verify repository identity and main-branch head metadata only."""
     checked_at = _now()
-    evidence: list[SourceEvidence] = []
-    errors: list[str] = []
-    head_sha = ""
 
-    def failed_report(reason: str) -> ReaderReport:
-        return ReaderReport(
+    def unverified(detail: str, head_sha: str = "") -> PathReport:
+        return PathReport(
             repository=CONTROL_REPOSITORY,
             branch=CONTROL_BRANCH,
+            repository_url=REPOSITORY_URL,
+            branch_url=BRANCH_URL,
             head_sha=head_sha,
             checked_at_utc=checked_at,
-            decision="DENY",
-            authorization_established=False,
-            sources=tuple(evidence),
-            errors=tuple(errors + [reason]),
+            status="PATH_UNVERIFIED",
+            detail=detail,
         )
 
     try:
-        commit = _request_json(
-            f"{API_ROOT}/repos/{CONTROL_REPOSITORY}/commits/{CONTROL_BRANCH}",
+        metadata = _request_json(
+            f"{API_ROOT}/repos/{CONTROL_REPOSITORY}",
             timeout,
         )
-        head_sha = commit.get("sha", "")
-        if not isinstance(head_sha, str) or len(head_sha) != 40:
-            return failed_report("Invalid or missing main-branch commit SHA.")
-        tree_url = f"{API_ROOT}/repos/{CONTROL_REPOSITORY}/git/trees/{head_sha}?recursive=1"
-        tree = _request_json(tree_url, timeout)
-        entries = tree.get("tree")
-        if not isinstance(entries, list) or tree.get("truncated") is True:
-            return failed_report("Git tree is missing, malformed, or truncated.")
-        tree_by_path = {
-            item.get("path"): item.get("sha")
-            for item in entries
-            if isinstance(item, dict) and item.get("type") == "blob"
-        }
-        for path in REQUIRED_PATHS:
-            expected_blob = tree_by_path.get(path)
-            if not isinstance(expected_blob, str) or len(expected_blob) != 40:
-                evidence.append(SourceEvidence(
-                    CONTROL_REPOSITORY, CONTROL_BRANCH, path, head_sha, "",
-                    checked_at, False, "MISSING", "Path absent from pinned Git tree."
-                ))
-                errors.append(f"Required source missing from tree: {path}")
-                continue
-            try:
-                payload = _request_json(
-                    f"{API_ROOT}/repos/{CONTROL_REPOSITORY}/contents/{path}?ref={head_sha}",
-                    timeout,
-                )
-                if payload.get("type") != "file" or payload.get("encoding") != "base64":
-                    raise ReaderError("GitHub content response is not a base64 file.")
-                encoded = payload.get("content")
-                if not isinstance(encoded, str):
-                    raise ReaderError("GitHub content response lacks content.")
-                raw = base64.b64decode(encoded, validate=False)
-                actual_blob = git_blob_sha(raw)
-                if not raw:
-                    raise ReaderError("Required source is empty.")
-                if actual_blob != expected_blob or payload.get("sha") != expected_blob:
-                    raise ReaderError("Blob SHA does not match pinned Git tree.")
-                evidence.append(SourceEvidence(
-                    CONTROL_REPOSITORY, CONTROL_BRANCH, path, head_sha,
-                    actual_blob, checked_at, True, "VERIFIED",
-                    "Content hash matches the tree at the pinned commit."
-                ))
-            except (HTTPError, URLError, TimeoutError, OSError, ValueError, ReaderError) as exc:
-                errors.append(f"{path}: {type(exc).__name__}: {exc}")
-                evidence.append(SourceEvidence(
-                    CONTROL_REPOSITORY, CONTROL_BRANCH, path, head_sha,
-                    "", checked_at, False, "UNVERIFIED", str(exc)
-                ))
+        if metadata.get("full_name", "").casefold() != CONTROL_REPOSITORY.casefold():
+            return unverified("Repository identity does not match the approved path.")
+        if metadata.get("archived") is True:
+            return unverified("The approved repository is archived.")
 
-        latest = _request_json(
+        branch_data = _request_json(
             f"{API_ROOT}/repos/{CONTROL_REPOSITORY}/commits/{CONTROL_BRANCH}",
             timeout,
         )
-        if latest.get("sha") != head_sha:
-            errors.append("Ali-Control main moved during collection; snapshot is stale.")
-        if errors or len(evidence) != len(REQUIRED_PATHS) or not all(x.verified for x in evidence):
-            return ReaderReport(
-                CONTROL_REPOSITORY, CONTROL_BRANCH, head_sha, checked_at,
-                "DENY", False, tuple(evidence), tuple(errors or ["Evidence incomplete."])
-            )
-        # Verified source evidence is not an approval signal. There is no
-        # trusted per-operation authorization contract in the current control repo.
-        return ReaderReport(
-            CONTROL_REPOSITORY, CONTROL_BRANCH, head_sha, checked_at,
-            "REQUIRE_APPROVAL", False, tuple(evidence),
-            ("Sources verified; no trusted per-operation authorization evidence exists.",)
+        head_sha = branch_data.get("sha")
+        if (
+            not isinstance(head_sha, str)
+            or len(head_sha) != 40
+            or any(char not in "0123456789abcdefABCDEF" for char in head_sha)
+        ):
+            return unverified("The main branch has no valid commit SHA.")
+
+        return PathReport(
+            repository=CONTROL_REPOSITORY,
+            branch=CONTROL_BRANCH,
+            repository_url=REPOSITORY_URL,
+            branch_url=BRANCH_URL,
+            head_sha=head_sha,
+            checked_at_utc=checked_at,
+            status="PATH_VERIFIED",
+            detail=(
+                "Repository identity and main-branch head verified. "
+                "No repository file contents were read; "
+                "this status does not authorize any operation."
+            ),
         )
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, ReaderError) as exc:
-        return failed_report(f"{type(exc).__name__}: {exc}")
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        LocatorError,
+    ) as exc:
+        return unverified(f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
-    print(json.dumps(collect_evidence().to_dict(), indent=2, ensure_ascii=False))
+    print(
+        json.dumps(
+            resolve_control_path().to_dict(),
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
