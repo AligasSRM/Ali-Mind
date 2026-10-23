@@ -64,6 +64,92 @@ _FORBIDDEN_ACTIONS = frozenset({
 })
 
 
+class ResumeStatus(str, Enum):
+    """Read-only result of comparing the saved checkpoint with the current HEAD."""
+
+    AT_CHECKPOINT = "AT_CHECKPOINT"
+    HEAD_DIVERGED = "HEAD_DIVERGED"
+    DENY = "DENY"
+
+
+@dataclass(frozen=True)
+class ResumeContext:
+    """Context needed to resume work; never performs a Git checkout or rollback."""
+
+    status: ResumeStatus
+    repository: str
+    branch: str
+    checkpoint_sha: str
+    observed_head_sha: str
+    objective: str
+    active_phase: str
+    phase_sequence: Tuple[str, ...]
+    allowed_paths: FrozenSet[str]
+    next_step: str
+    reason: str
+
+
+def prepare_resume_context(
+    snapshot: Optional[ControlSnapshot],
+    current_head_sha: str,
+) -> ResumeContext:
+    """Recover the approved work context and compare refs without changing Git.
+
+    A divergent HEAD is not reset. The result preserves the historical checkpoint
+    and tells the caller to inspect the difference before resuming.
+    """
+    if snapshot is None:
+        return ResumeContext(
+            ResumeStatus.DENY, ALLOWED_REPOSITORY, ALLOWED_BRANCH, "", "",
+            "", "", (), frozenset(), "stop", "Missing checkpoint context.",
+        )
+
+    required = (
+        snapshot.historical_checkpoint_sha,
+        snapshot.observed_head_sha,
+        snapshot.objective,
+        snapshot.active_phase,
+    )
+    if not all(required):
+        return ResumeContext(
+            ResumeStatus.DENY, snapshot.repository, snapshot.branch,
+            snapshot.historical_checkpoint_sha, snapshot.observed_head_sha,
+            snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
+            snapshot.allowed_paths, "stop", "Checkpoint context is incomplete.",
+        )
+    if snapshot.repository != ALLOWED_REPOSITORY or snapshot.branch != ALLOWED_BRANCH:
+        return ResumeContext(
+            ResumeStatus.DENY, snapshot.repository, snapshot.branch,
+            snapshot.historical_checkpoint_sha, snapshot.observed_head_sha,
+            snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
+            snapshot.allowed_paths, "stop", "Checkpoint is outside the permitted repository or branch.",
+        )
+    if not current_head_sha or current_head_sha != snapshot.observed_head_sha:
+        return ResumeContext(
+            ResumeStatus.DENY, snapshot.repository, snapshot.branch,
+            snapshot.historical_checkpoint_sha, snapshot.observed_head_sha,
+            snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
+            snapshot.allowed_paths, "recheck_current_head",
+            "The supplied current HEAD does not match the observed HEAD in the snapshot.",
+        )
+
+    if current_head_sha == snapshot.historical_checkpoint_sha:
+        return ResumeContext(
+            ResumeStatus.AT_CHECKPOINT, snapshot.repository, snapshot.branch,
+            snapshot.historical_checkpoint_sha, current_head_sha,
+            snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
+            snapshot.allowed_paths, "resume_from_checkpoint_context",
+            "Current HEAD matches the historical checkpoint; no Git mutation was performed.",
+        )
+    return ResumeContext(
+        ResumeStatus.HEAD_DIVERGED, snapshot.repository, snapshot.branch,
+        snapshot.historical_checkpoint_sha, current_head_sha,
+        snapshot.objective, snapshot.active_phase, snapshot.phase_sequence,
+        snapshot.allowed_paths, "compare_current_head_with_checkpoint",
+        "Current HEAD differs from the historical checkpoint. Preserve both references; compare the difference and resume context without resetting or rewriting Git.",
+    )
+
+
 def evaluate(snapshot: Optional[ControlSnapshot], request: OperationRequest) -> GateResult:
     """Evaluate supplied fields as consistency checks only; not a live authorization."""
     checks = []
